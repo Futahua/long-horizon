@@ -68,7 +68,10 @@ anything — an afternoon, not a plan.
 Not blockers to route around — decisions:
 
 1. **Papers host changes.** Both unbuilt features modify `Papers-3`. A host change was
-   declined on 2026-09-13; building these reopens that.
+   declined on 2026-09-13. **Reopened and granted on 2026-09-15** for window identity:
+   Lane 4 may change `Papers-3` itself, not only probes beside it. The grant is for
+   identity work — reversible, testable without touching windows the creator is looking
+   at. It does not extend to foreign windows.
 2. **Anything with a human in the loop at the machine** — watching real windows move.
    No test coverage substitutes for it.
 3. **Anything irreversible**: the live vault, real layouts, real windows.
