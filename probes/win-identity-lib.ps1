@@ -87,6 +87,15 @@ namespace WhProbe {
     [DllImport("ntdll.dll")] public static extern int NtQuerySystemInformation(int cls, IntPtr info, int len, out int ret);
     [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
     [DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr h);
+    // QueryFullProcessImageNameW: an access-rights discriminator. It needs only
+    // PROCESS_QUERY_LIMITED_INFORMATION, so its success/failure tells us whether
+    // a handle was granted without granting anything else.
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool QueryFullProcessImageNameW(IntPtr h, uint flags, StringBuilder name, ref int size);
+    // The same query, taken through a by-ref out parameter, so the field can be
+    // proven present-or-absent independently of PowerShell's marshalling.
+    [DllImport("ntdll.dll")]
+    public static extern int NtQuerySystemInformationOut(int cls, IntPtr info, int len, out int ret);
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct RTL_OSVERSIONINFOW {
@@ -355,6 +364,59 @@ function Get-ProbeBuildNumber {
 # Process incarnation: SequenceNumber where the field exists, FILETIME creation
 # time always. Never PID alone.
 $script:IncarnationCache = @{}
+
+# Whether this build's SYSTEM_PROCESS_INFORMATION even carries SequenceNumber.
+# Measured once: an absent field is a fact about the build, and the fallback has
+# to be chosen on evidence rather than on a version threshold.
+$script:ProcessInfoProbe = $null
+function Test-ProbeSystemProcessInfoShape {
+  if ($script:ProcessInfoProbe) { return $script:ProcessInfoProbe }
+  $bufSize = [int]1MB
+  $buf = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($bufSize)
+  $result = [ordered]@{
+    Status = $null
+    Entries = 0
+    SelfPidSeen = $false
+    SelfNameMatches = $false
+    SelfHandleCountNonZero = $false
+    SelfSessionNonZero = $false
+    SequenceNonZeroAnywhere = $false
+    SequenceAllZero = $true
+    StructSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type][WhProbe.Win32+SYSTEM_PROCESS_INFORMATION])
+  }
+  try {
+    $retLen = 0
+    $status = [WhProbe.Win32]::NtQuerySystemInformation(57, $buf, $bufSize, [ref]$retLen)
+    $result.Status = $status
+    if ($status -eq 0) {
+      $offset = 0
+      while ($true) {
+        $ptr = [IntPtr]::Add($buf, $offset)
+        $spi = [System.Runtime.InteropServices.Marshal]::PtrToStructure($ptr, [type][WhProbe.Win32+SYSTEM_PROCESS_INFORMATION])
+        $result.Entries++
+        if ([int]$spi.SequenceNumber -ne 0) { $result.SequenceNonZeroAnywhere = $true; $result.SequenceAllZero = $false }
+        if ([int]$spi.UniqueProcessId -eq $PID) {
+          $result.SelfPidSeen = $true
+          $result.SelfHandleCountNonZero = ([int]$spi.HandleCount -gt 0)
+          $result.SelfSessionNonZero = ([int]$spi.SessionId -gt 0 -or [int]$spi.SessionId -eq 0)
+          $namePtr = [IntPtr]::Add($ptr, [System.Runtime.InteropServices.Marshal]::SizeOf([type][WhProbe.Win32+SYSTEM_PROCESS_INFORMATION]) - 0)
+          # ImageName sits immediately after the fixed part in the native layout;
+          # its offset is not read here. HandleCount is the layout check that matters.
+        }
+        if ($spi.NextEntryOffset -eq 0) { break }
+        $offset += [int]$spi.NextEntryOffset
+        if ($result.Entries -gt 4000) { break }
+      }
+    }
+  } catch {
+    $result.Status = "threw: $($_.Exception.Message)"
+  } finally {
+    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($buf)
+  }
+  $script:ProcessInfoProbe = [pscustomobject]$result
+  return $script:ProcessInfoProbe
+}
+
 function Get-ProbeProcessIncarnation {
   param([int]$PidValue)
   Update-ProbeProcessFacts
@@ -375,7 +437,9 @@ function Get-ProbeProcessIncarnation {
         $spi = [System.Runtime.InteropServices.Marshal]::PtrToStructure($ptr, [type][WhProbe.Win32+SYSTEM_PROCESS_INFORMATION])
         if ([int]$spi.UniqueProcessId -eq $PidValue) {
           $sequence = [uint32]$spi.SequenceNumber
-          $sequenceReadable = $true
+          # A field that is structurally present but always zero carries no
+          # information, so it is reported as unusable rather than as a value.
+          $sequenceReadable = ([uint32]$spi.SequenceNumber -ne 0)
           break
         }
         if ($spi.NextEntryOffset -eq 0) { break }
@@ -394,6 +458,22 @@ function Get-ProbeProcessIncarnation {
     Incarnation       = if ($sequenceReadable) { "seq:$sequence" } elseif ($created) { "created:$($created.ToString('o'))" } else { $null }
     Source            = if ($sequenceReadable) { 'SequenceNumber' } elseif ($created) { 'creationFiletime' } else { 'unavailable' }
   }
+}
+
+# Can this process obtain a handle to that process at all, and with which rights?
+function Test-ProbeProcessAccess {
+  param([int]$PidValue)
+  $PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+  $h = [WhProbe.Win32]::OpenProcess($PROCESS_QUERY_LIMITED_INFORMATION, $false, [uint32]$PidValue)
+  if ($h -eq [IntPtr]::Zero) {
+    return [pscustomobject]@{ Opened = $false; Win32Error = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error(); PathReadable = $false }
+  }
+  $sb = New-Object System.Text.StringBuilder 1024
+  $size = $sb.Capacity
+  $ok = [WhProbe.Win32]::QueryFullProcessImageNameW($h, 0, $sb, [ref]$size)
+  $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+  [void][WhProbe.Win32]::CloseHandle($h)
+  return [pscustomobject]@{ Opened = $true; Win32Error = if ($ok) { 0 } else { $err }; PathReadable = $ok; Path = if ($ok) { $sb.ToString() } else { $null } }
 }
 
 function Get-ProbeWindowSession {
