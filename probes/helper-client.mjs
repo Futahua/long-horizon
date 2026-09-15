@@ -10,17 +10,60 @@
 //
 // Usage:
 //   node helper-client.mjs <helper.ps1> <powershell.exe> list
-//   node helper-client.mjs <helper.ps1> <powershell.exe> observe <token>
-//   node helper-client.mjs <helper.ps1> <powershell.exe> list,observe:<token>,list
+//   node helper-client.mjs <helper.ps1> <powershell.exe> observe:<token>
+//   node helper-client.mjs <helper.ps1> <powershell.exe> list,observe:<token>|use:1,list
+//
+// Plan steps, run IN ORDER inside ONE helper process (which is what keeps a
+// session token valid across steps):
+//   list                     -> a list request
+//   observe:<token>          -> an observe request for that token
+//   observe:last             -> observe using the first token from the last list
+//   sleep:<ms>               -> wait between steps
+//   action:<text>            -> print a marker (the parent mutates the window here)
 //
 // Prints one JSON line per response to stdout, prefixed with "RESP ".
 
 import { spawn } from 'node:child_process';
 
-const [helperPath, psPath, plan] = process.argv.slice(2);
+const [helperPath, psPath, plan, mutatorPath, mutatorHwnd] = process.argv.slice(2);
 if (!helperPath || !psPath || !plan) {
-  console.error('usage: helper-client.mjs <helper.ps1> <powershell.exe> <plan>');
+  console.error('usage: helper-client.mjs <helper.ps1> <powershell.exe> <plan> [mutator.ps1] [hwnd]');
   process.exit(2);
+}
+
+// Responses are ALSO written to a JSON file. Piping them through a shell proved
+// unreliable: PowerShell's 2>&1 interleaving injected a non-string record that
+// silently shifted every later assertion by one. A file has no such failure mode.
+const RESPONSE_FILE = process.env.PROBE_RESPONSE_FILE;
+
+function emit(entry) {
+  console.log(`RESP ${JSON.stringify(entry)}`);
+}
+
+/**
+ * Run the mutator script between two requests, so the helper process stays ALIVE
+ * across the change. Without this the token would die with the helper and the
+ * probe would be measuring a helper restart instead of a title change — which is
+ * exactly the instrument defect the first version of this probe had.
+ */
+function runMutator() {
+  return new Promise((resolve) => {
+    if (!mutatorPath) {
+      console.log('ACTION no-mutator');
+      return resolve();
+    }
+    const m = spawn(psPath, ['-NoProfile', '-File', mutatorPath, String(mutatorHwnd ?? '')], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    let out = '';
+    m.stdout.on('data', (c) => { out += c; });
+    m.stderr.on('data', (c) => { out += c; });
+    m.on('exit', (code) => {
+      console.log(`ACTION mutator-exit=${code} ${out.trim().slice(0, 200)}`);
+      resolve();
+    });
+  });
 }
 
 const child = spawn(psPath, ['-NoProfile', '-NonInteractive', '-File', helperPath], {
@@ -79,10 +122,43 @@ function request(method, target) {
 await new Promise((r) => setTimeout(r, 1200));
 
 const steps = plan.split(',').filter(Boolean);
+const collected = [];
+let lastTokens = [];
 for (const step of steps) {
-  const [method, target] = step.split(':');
+  if (step.startsWith('action:')) {
+    console.log(`ACTION ${step.slice(7)}`);
+    continue;
+  }
+  if (step.startsWith('mutate')) {
+    await runMutator();
+    continue;
+  }
+  if (step.startsWith('sleep:')) {
+    await new Promise((r) => setTimeout(r, Number(step.slice(6)) || 0));
+    continue;
+  }
+  const [method, arg] = step.split(':');
+  let target;
+  if (method === 'observe' || method === 'thumbnail' || method === 'close') {
+    target = arg === 'last' ? lastTokens[0] : arg;
+    if (!target) {
+      const err = { __error: 'no token available for step', step };
+      collected.push(err);
+      emit(err);
+      continue;
+    }
+  }
   const resp = await request(method, target);
-  console.log(`RESP ${JSON.stringify(resp)}`);
+  if (resp && Array.isArray(resp.windows)) {
+    lastTokens = resp.windows.map((w) => w.runtimeId);
+  }
+  collected.push(resp);
+  emit(resp);
+}
+
+if (RESPONSE_FILE) {
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(RESPONSE_FILE, JSON.stringify(collected, null, 2), 'utf8');
 }
 
 child.stdin.end();
